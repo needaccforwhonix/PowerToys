@@ -55,16 +55,39 @@ public partial class ShellViewModel : ObservableObject,
                 oldValue.PropertyChanged -= CurrentPage_PropertyChanged;
                 value.PropertyChanged += CurrentPage_PropertyChanged;
 
-                if (oldValue is IDisposable disposable)
+                // Re-evaluate search-box visibility for the page we're switching to.
+                // CurrentPage_PropertyChanged only reacts to a *change* of HasSearchBox, so
+                // switching to a page whose HasSearchBox already holds its final value (e.g.
+                // navigating back to a list from a ContentPage) would otherwise never restore
+                // the search box. Only force it visible here; hiding it on content pages is
+                // deliberately deferred (see ShellPage.FocusAfterLoaded) so focus doesn't jump
+                // around for screen readers.
+                if (value.HasSearchBox)
                 {
-                    try
+                    IsSearchBoxVisible = true;
+                }
+
+                try
+                {
+                    if (oldValue is ListViewModel previousList)
+                    {
+                        // Frame keeps the VM in its navigation parameter for Back.
+                        // Cancel this visit's work without permanently disposing it.
+                        previousList.SuspendForNavigation();
+                    }
+                    else if (oldValue is IDisposable disposable)
                     {
                         disposable.Dispose();
                     }
-                    catch (Exception ex)
-                    {
-                        CoreLogger.LogError(ex.ToString());
-                    }
+                }
+                catch (Exception ex)
+                {
+                    CoreLogger.LogError(ex.ToString());
+                }
+
+                if (value is ListViewModel currentList)
+                {
+                    _ = currentList.ResumeAfterNavigation();
                 }
             }
         }
@@ -84,6 +107,8 @@ public partial class ShellViewModel : ObservableObject,
     private bool _currentlyTransient;
 
     public bool IsNested => _isNested && !_currentlyTransient;
+
+    public bool IsTransient => _currentlyTransient;
 
     public PageViewModel NullPage { get; private set; }
 
@@ -284,6 +309,11 @@ public partial class ShellViewModel : ObservableObject,
             {
                 CoreLogger.LogDebug($"Navigating to page");
 
+                if (message.ShowWindowIfPage)
+                {
+                    WeakReferenceMessenger.Default.Send<ShowWindowMessage>(new(IntPtr.Zero));
+                }
+
                 _isNested = !isMainPage;
                 _currentlyTransient = message.TransientPage;
 
@@ -293,6 +323,7 @@ public partial class ShellViewModel : ObservableObject,
                     var extensionId = host.GetExtensionDisplayName() ?? "builtin";
                     var commandId = command?.Id ?? "unknown";
                     var commandName = command?.Name ?? "unknown";
+                    WeakReferenceMessenger.Default.Send<TelemetryCommandStartedMessage>();
                     WeakReferenceMessenger.Default.Send<TelemetryExtensionInvokedMessage>(
                         new(extensionId, commandId, commandName, true, 0));
                 }
@@ -360,6 +391,8 @@ public partial class ShellViewModel : ObservableObject,
             }
             else
             {
+                // Count only accepted invocations, before Invoke can hide the palette and end the session.
+                WeakReferenceMessenger.Default.Send<TelemetryCommandStartedMessage>();
                 _handleInvokeTask = Task.Run(() =>
                 {
                     SafeHandleInvokeCommandSynchronous(message, invokable, host);
@@ -380,20 +413,30 @@ public partial class ShellViewModel : ObservableObject,
 
         try
         {
-            // Call out to extension process.
-            // * May fail!
-            // * May never return!
-            var result = invokable.Invoke(message.Context);
+            ICommandResult? result;
+            try
+            {
+                // Call out to extension process.
+                // * May fail!
+                // * May never return!
+                result = invokable.Invoke(message.Context);
+                success = true;
+            }
+            finally
+            {
+                // Report the invocation outcome before processing its result.
+                stopwatch.Stop();
+                WeakReferenceMessenger.Default.Send<TelemetryExtensionInvokedMessage>(
+                    new(extensionId, commandId, commandName, success, (ulong)stopwatch.ElapsedMilliseconds));
+            }
 
             // But if it did succeed, we need to handle the result.
-            UnsafeHandleCommandResult(result);
+            UnsafeHandleCommandResult(result, message.OnBeforeShowConfirmation);
 
-            success = true;
             _handleInvokeTask = null;
         }
         catch (Exception ex)
         {
-            success = false;
             _handleInvokeTask = null;
 
             // Telemetry: Track errors for session metrics
@@ -403,16 +446,9 @@ public partial class ShellViewModel : ObservableObject,
             // than a silent log message.
             host?.Log(ex.Message);
         }
-        finally
-        {
-            // Telemetry: Send extension invocation metrics (always sent, even on failure)
-            stopwatch.Stop();
-            WeakReferenceMessenger.Default.Send<TelemetryExtensionInvokedMessage>(
-                new(extensionId, commandId, commandName, success, (ulong)stopwatch.ElapsedMilliseconds));
-        }
     }
 
-    private void UnsafeHandleCommandResult(ICommandResult? result)
+    private void UnsafeHandleCommandResult(ICommandResult? result, Action? onBeforeShowConfirmation = null)
     {
         if (result is null)
         {
@@ -464,6 +500,17 @@ public partial class ShellViewModel : ObservableObject,
                 {
                     if (result.Args is IConfirmationArgs a)
                     {
+                        // Give the original sender (e.g. the dock) a chance to
+                        // prepare UI before the confirmation dialog surfaces.
+                        try
+                        {
+                            onBeforeShowConfirmation?.Invoke();
+                        }
+                        catch (Exception ex)
+                        {
+                            CoreLogger.LogError(ex.ToString());
+                        }
+
                         WeakReferenceMessenger.Default.Send<ShowConfirmationMessage>(new(a));
                     }
 
@@ -474,8 +521,28 @@ public partial class ShellViewModel : ObservableObject,
                 {
                     if (result.Args is IToastArgs a)
                     {
-                        WeakReferenceMessenger.Default.Send<ShowToastMessage>(new(a.Message));
-                        UnsafeHandleCommandResult(a.Result);
+                        // Extensions built against newer SDKs can attach an icon
+                        // and an action command via IToastArgs2.
+                        IconInfoViewModel? icon = null;
+                        CommandViewModel? command = null;
+                        if (a is IToastArgs2 a2)
+                        {
+                            if (a2.Icon is not null)
+                            {
+                                icon = new IconInfoViewModel(a2.Icon);
+                                icon.InitializeProperties();
+                            }
+
+                            var toastCommand = a2.Command;
+                            if (toastCommand is not null)
+                            {
+                                command = new CommandViewModel(toastCommand, new(CurrentPage));
+                                command.InitializeProperties();
+                            }
+                        }
+
+                        WeakReferenceMessenger.Default.Send<ShowToastMessage>(new(a.Message, icon, command));
+                        UnsafeHandleCommandResult(a.Result, onBeforeShowConfirmation);
                     }
 
                     break;
@@ -487,6 +554,18 @@ public partial class ShellViewModel : ObservableObject,
     {
         _rootPageService.GoHome();
         WeakReferenceMessenger.Default.Send<GoHomeMessage>(new(withAnimation, focusSearch));
+    }
+
+    /// <summary>
+    /// Resets navigation to the root page, clearing any transient state.
+    /// Use when entering from a hotkey while the palette may already be
+    /// showing a transient dock page.
+    /// </summary>
+    public void ResetToHome()
+    {
+        _currentlyTransient = false;
+        _rootPageService.GoHome();
+        WeakReferenceMessenger.Default.Send<PerformCommandMessage>(new(new ExtensionObject<ICommand>(_rootPage)));
     }
 
     public void GoBack(bool withAnimation = true, bool focusSearch = true)
