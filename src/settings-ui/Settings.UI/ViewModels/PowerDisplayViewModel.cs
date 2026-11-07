@@ -36,6 +36,10 @@ namespace Microsoft.PowerToys.Settings.UI.ViewModels
             "PowerDisplay",
             "crash_detected.flag");
 
+        private readonly Func<CancellationToken, Task<PowerDisplayProfiles>> _loadProfilesAsync;
+        private readonly Func<int, int?, Task<bool>> _reorderProfileAsync;
+        private readonly Func<PowerDisplayProfile, Task> _addOrUpdateProfileAsync;
+        private readonly Func<int, Task<bool>> _removeProfileByIdAsync;
         private readonly Action<string> _signalNamedEvent;
 
         private bool _isProfilesLoading;
@@ -63,7 +67,17 @@ namespace Microsoft.PowerToys.Settings.UI.ViewModels
         {
         }
 
-        internal PowerDisplayViewModel(SettingsUtils settingsUtils, ISettingsRepository<GeneralSettings> settingsRepository, ISettingsRepository<PowerDisplaySettings> powerDisplaySettingsRepository, Func<string, int> ipcMSGCallBackFunc, Action<string, Action> waitForEventLoop, Action<string> signalNamedEvent)
+        internal PowerDisplayViewModel(
+            SettingsUtils settingsUtils,
+            ISettingsRepository<GeneralSettings> settingsRepository,
+            ISettingsRepository<PowerDisplaySettings> powerDisplaySettingsRepository,
+            Func<string, int> ipcMSGCallBackFunc,
+            Action<string, Action> waitForEventLoop,
+            Action<string> signalNamedEvent,
+            Func<CancellationToken, Task<PowerDisplayProfiles>> loadProfilesAsync = null,
+            Func<int, int?, Task<bool>> reorderProfileAsync = null,
+            Func<PowerDisplayProfile, Task> addOrUpdateProfileAsync = null,
+            Func<int, Task<bool>> removeProfileByIdAsync = null)
         {
             // To obtain the general settings configurations of PowerToys Settings.
             ArgumentNullException.ThrowIfNull(settingsRepository);
@@ -73,6 +87,11 @@ namespace Microsoft.PowerToys.Settings.UI.ViewModels
             _signalNamedEvent = signalNamedEvent;
             SettingsUtils = settingsUtils;
             GeneralSettingsConfig = settingsRepository.SettingsConfig;
+            _loadProfilesAsync = loadProfilesAsync ?? ProfileHelper.LoadProfilesAsync;
+            _reorderProfileAsync = reorderProfileAsync ?? ((id, beforeId) =>
+                ProfileHelper.UpdateProfilesAsync(profiles => profiles.MoveProfileBefore(id, beforeId)));
+            _addOrUpdateProfileAsync = addOrUpdateProfileAsync ?? (profile => ProfileHelper.AddOrUpdateProfileAsync(profile));
+            _removeProfileByIdAsync = removeProfileByIdAsync ?? (id => ProfileHelper.RemoveProfileByIdAsync(id));
 
             _settings = powerDisplaySettingsRepository.SettingsConfig;
 
@@ -86,7 +105,7 @@ namespace Microsoft.PowerToys.Settings.UI.ViewModels
 
             Logger.LogInfo($"[Constructor] Initializing with {loadedMonitors.Count} monitors from settings (filtered)");
 
-            Monitors = new ObservableCollection<MonitorInfo>(loadedMonitors);
+            ReplaceMonitors(new ObservableCollection<MonitorInfo>(loadedMonitors));
 
             // set the callback functions value to handle outgoing IPC message.
             SendConfigMSG = ipcMSGCallBackFunc;
@@ -207,6 +226,7 @@ namespace Microsoft.PowerToys.Settings.UI.ViewModels
             _isEnabled = value;
             OnPropertyChanged(nameof(IsEnabled));
             OnPropertyChanged(nameof(CanUseProfiles));
+            OnPropertyChanged(nameof(CanDragProfiles));
 
             GeneralSettingsConfig.Enabled.PowerDisplay = value;
             OutGoingGeneralSettings outgoing = new OutGoingGeneralSettings(GeneralSettingsConfig);
@@ -445,31 +465,29 @@ namespace Microsoft.PowerToys.Settings.UI.ViewModels
 
         public List<int> MouseWheelIncrementOptions => _mouseWheelIncrementOptions;
 
-        public ObservableCollection<MonitorInfo> Monitors
+        public ObservableCollection<MonitorInfo> Monitors => _monitors;
+
+        private void ReplaceMonitors(ObservableCollection<MonitorInfo> value)
         {
-            get => _monitors;
-            set
+            if (_monitors != null)
             {
-                if (_monitors != null)
-                {
-                    _monitors.CollectionChanged -= Monitors_CollectionChanged;
-                    UnsubscribeFromItemPropertyChanged(_monitors);
-                }
-
-                _monitors = value;
-
-                if (_monitors != null)
-                {
-                    _monitors.CollectionChanged += Monitors_CollectionChanged;
-                    SubscribeToItemPropertyChanged(_monitors);
-                }
-
-                OnPropertyChanged(nameof(Monitors));
-                HasMonitors = _monitors?.Count > 0;
-
-                // Update TotalMonitorCount for dynamic DisplayName
-                UpdateTotalMonitorCount();
+                _monitors.CollectionChanged -= Monitors_CollectionChanged;
+                UnsubscribeFromItemPropertyChanged(_monitors);
             }
+
+            _monitors = value;
+
+            if (_monitors != null)
+            {
+                _monitors.CollectionChanged += Monitors_CollectionChanged;
+                SubscribeToItemPropertyChanged(_monitors);
+            }
+
+            OnPropertyChanged(nameof(Monitors));
+            HasMonitors = _monitors?.Count > 0;
+
+            // Update TotalMonitorCount for dynamic DisplayName
+            UpdateTotalMonitorCount();
         }
 
         public bool HasMonitors
@@ -704,7 +722,7 @@ namespace Microsoft.PowerToys.Settings.UI.ViewModels
                 if (Monitors == null)
                 {
                     // First time initialization - create new collection
-                    Monitors = new ObservableCollection<MonitorInfo>(updatedMonitors);
+                    ReplaceMonitors(new ObservableCollection<MonitorInfo>(updatedMonitors));
                 }
                 else
                 {
@@ -743,7 +761,8 @@ namespace Microsoft.PowerToys.Settings.UI.ViewModels
                 // Rebuild _settings.Properties.Monitors so visible items share refs
                 // with _monitors (user toggles will be visible to save). Legacy entries
                 // use the freshly-read instances; we never bind them to UI.
-                _settings.Properties.Monitors = _monitors.Concat(legacyFromDisk).ToList();
+                _settings.Properties.Monitors.Clear();
+                _settings.Properties.Monitors.AddRange(_monitors.Concat(legacyFromDisk));
 
                 Logger.LogInfo($"Successfully reloaded {updatedMonitors.Count} monitors");
             }
@@ -773,6 +792,8 @@ namespace Microsoft.PowerToys.Settings.UI.ViewModels
         // Profile-related fields
         private bool _suppressProfileSelectionPersistence;
         private ObservableCollection<PowerDisplayProfile> _profiles = new ObservableCollection<PowerDisplayProfile>();
+        private List<PowerDisplayProfile> _savedProfiles = new List<PowerDisplayProfile>();
+        private bool _isProfileReorderError;
 
         // Custom VCP mapping fields
         private ObservableCollection<CustomVcpValueMapping> _customVcpMappings;
@@ -805,6 +826,7 @@ namespace Microsoft.PowerToys.Settings.UI.ViewModels
             }
 
             OnPropertyChanged(nameof(HasProfiles));
+            OnPropertyChanged(nameof(IsProfileDragDisabledByElevation));
         }
 
         public bool IsProfilesLoading
@@ -820,16 +842,38 @@ namespace Microsoft.PowerToys.Settings.UI.ViewModels
                 _isProfilesLoading = value;
                 OnPropertyChanged(nameof(IsProfilesLoading));
                 OnPropertyChanged(nameof(CanUseProfiles));
+                OnPropertyChanged(nameof(CanDragProfiles));
             }
         }
 
         public bool CanUseProfiles => IsEnabled && !IsProfilesLoading;
+
+        // Like Mouse Without Borders, do not enter WinUI's native drag/drop path while elevated.
+        // https://github.com/microsoft/microsoft-ui-xaml/issues/7690
+        public bool CanDragProfiles => CanUseProfiles && !GeneralSettingsConfig.IsElevated;
+
+        public bool IsProfileDragDisabledByElevation => GeneralSettingsConfig.IsElevated && HasProfiles;
+
+        public bool IsProfileReorderError
+        {
+            get => _isProfileReorderError;
+            private set
+            {
+                if (_isProfileReorderError != value)
+                {
+                    _isProfileReorderError = value;
+                    OnPropertyChanged(nameof(IsProfileReorderError));
+                }
+            }
+        }
 
         public void RefreshEnabledState()
         {
             InitializeEnabledValue();
             OnPropertyChanged(nameof(IsEnabled));
             OnPropertyChanged(nameof(CanUseProfiles));
+            OnPropertyChanged(nameof(CanDragProfiles));
+            OnPropertyChanged(nameof(IsProfileDragDisabledByElevation));
         }
 
         private bool SetSettingsProperty<T>(T currentValue, T newValue, Action<T> setter, [CallerMemberName] string propertyName = null)
@@ -854,6 +898,7 @@ namespace Microsoft.PowerToys.Settings.UI.ViewModels
 
             IsProfilesLoading = true;
             _suppressProfileSelectionPersistence = true;
+            IsProfileReorderError = false;
             try
             {
                 var loaded = await LoadProfilesCoreAsync(cancellationToken);
@@ -862,6 +907,7 @@ namespace Microsoft.PowerToys.Settings.UI.ViewModels
             catch (Exception ex)
             {
                 Profiles.Clear();
+                IsProfileReorderError = true;
                 Logger.LogError($"Failed to load profiles: {ex.Message}");
             }
             finally
@@ -869,24 +915,129 @@ namespace Microsoft.PowerToys.Settings.UI.ViewModels
                 _suppressProfileSelectionPersistence = false;
                 IsProfilesLoading = false;
                 OnPropertyChanged(nameof(HasProfiles));
+                OnPropertyChanged(nameof(IsProfileDragDisabledByElevation));
             }
         }
 
-        private static Task<PowerDisplayProfiles> LoadProfilesCoreAsync(
+        private Task<PowerDisplayProfiles> LoadProfilesCoreAsync(
             CancellationToken cancellationToken)
         {
-            return ProfileHelper.LoadProfilesAsync(cancellationToken);
+            return _loadProfilesAsync(cancellationToken);
         }
 
         private void ReplaceProfiles(PowerDisplayProfiles profilesData)
         {
-            Profiles.Clear();
-            foreach (var profile in profilesData.GetAssignedProfiles())
+            var profiles = profilesData.GetAssignedProfiles().ToList();
+            var wasSuppressed = _suppressProfileSelectionPersistence;
+            _suppressProfileSelectionPersistence = true;
+            try
             {
-                Profiles.Add(profile);
+                // Suppress the temporary empty state so the expander stays open while refreshing.
+                Profiles.Clear();
+                foreach (var profile in profiles)
+                {
+                    Profiles.Add(profile);
+                }
+
+                _savedProfiles = profiles;
+            }
+            finally
+            {
+                _suppressProfileSelectionPersistence = wasSuppressed;
             }
 
+            OnPropertyChanged(nameof(HasProfiles));
+            OnPropertyChanged(nameof(IsProfileDragDisabledByElevation));
             Logger.LogInfo($"Loaded {Profiles.Count} profiles");
+        }
+
+        public bool CanMoveProfileUp(PowerDisplayProfile profile)
+            => CanUseProfiles && FindProfileIndex(profile?.Id ?? 0) > 0;
+
+        public bool CanMoveProfileDown(PowerDisplayProfile profile)
+        {
+            var index = FindProfileIndex(profile?.Id ?? 0);
+            return CanUseProfiles && index >= 0 && index < Profiles.Count - 1;
+        }
+
+        public Task MoveProfileUpAsync(PowerDisplayProfile profile)
+        {
+            if (!CanMoveProfileUp(profile))
+            {
+                return Task.CompletedTask;
+            }
+
+            var index = FindProfileIndex(profile.Id);
+            return ReorderProfileAsync(profile.Id, Profiles[index - 1].Id);
+        }
+
+        public Task MoveProfileDownAsync(PowerDisplayProfile profile)
+        {
+            if (!CanMoveProfileDown(profile))
+            {
+                return Task.CompletedTask;
+            }
+
+            var index = FindProfileIndex(profile.Id);
+            int? beforeId = index + 2 < Profiles.Count ? Profiles[index + 2].Id : null;
+            return ReorderProfileAsync(profile.Id, beforeId);
+        }
+
+        private int FindProfileIndex(int id)
+        {
+            for (var index = 0; index < Profiles.Count; index++)
+            {
+                if (Profiles[index].Id == id)
+                {
+                    return index;
+                }
+            }
+
+            return -1;
+        }
+
+        public async Task ReorderProfileAsync(int profileId, int? beforeProfileId)
+        {
+            if (!CanUseProfiles || profileId < 1 || beforeProfileId is < 1 || profileId == beforeProfileId)
+            {
+                return;
+            }
+
+            IsProfilesLoading = true;
+            IsProfileReorderError = false;
+            try
+            {
+                // Move by stable ids in the latest stored list. Saving the UI's entire snapshot
+                // would overwrite concurrent profile edits or drop profiles added by another process.
+                if (await _reorderProfileAsync(profileId, beforeProfileId))
+                {
+                    // Keep a fallback for a successful write followed by an unreadable file.
+                    var saved = new PowerDisplayProfiles { Profiles = _savedProfiles.ToList() };
+                    saved.MoveProfileBefore(profileId, beforeProfileId);
+                    _savedProfiles = saved.Profiles;
+                    SignalSettingsUpdated();
+                }
+
+                ReplaceProfiles(await LoadProfilesCoreAsync(CancellationToken.None));
+            }
+            catch (Exception ex)
+            {
+                IsProfileReorderError = true;
+                Logger.LogError($"Failed to reorder profiles: {ex.Message}");
+                try
+                {
+                    ReplaceProfiles(await LoadProfilesCoreAsync(CancellationToken.None));
+                }
+                catch (Exception reloadException)
+                {
+                    Logger.LogError($"Failed to reload profiles after reordering: {reloadException.Message}");
+                    ReplaceProfiles(new PowerDisplayProfiles { Profiles = _savedProfiles });
+                }
+            }
+            finally
+            {
+                IsProfilesLoading = false;
+            }
         }
 
         /// <summary>
@@ -951,9 +1102,10 @@ namespace Microsoft.PowerToys.Settings.UI.ViewModels
             IsProfilesLoading = true;
             try
             {
-                await ProfileHelper.AddOrUpdateProfileAsync(profile);
+                await _addOrUpdateProfileAsync(profile);
                 var profiles = await LoadProfilesCoreAsync(CancellationToken.None);
                 ReplaceProfiles(profiles);
+                IsProfileReorderError = false;
                 SignalSettingsUpdated();
             }
             catch (Exception ex)
@@ -983,7 +1135,7 @@ namespace Microsoft.PowerToys.Settings.UI.ViewModels
             IsProfilesLoading = true;
             try
             {
-                if (!await ProfileHelper.RemoveProfileByIdAsync(id))
+                if (!await _removeProfileByIdAsync(id))
                 {
                     Logger.LogWarning($"Profile id {id} was not found");
                     return;
@@ -991,6 +1143,7 @@ namespace Microsoft.PowerToys.Settings.UI.ViewModels
 
                 var profiles = await LoadProfilesCoreAsync(CancellationToken.None);
                 ReplaceProfiles(profiles);
+                IsProfileReorderError = false;
                 SignalSettingsUpdated();
                 await ClearDeletedProfileReferencesAsync(id);
             }
@@ -1104,7 +1257,8 @@ namespace Microsoft.PowerToys.Settings.UI.ViewModels
         /// </summary>
         private void SaveCustomVcpMappings()
         {
-            _settings.Properties.CustomVcpMappings = CustomVcpMappings.ToList();
+            _settings.Properties.CustomVcpMappings.Clear();
+            _settings.Properties.CustomVcpMappings.AddRange(CustomVcpMappings);
             NotifySettingsChanged();
 
             // Signal PowerDisplay to reload settings
@@ -1123,7 +1277,9 @@ namespace Microsoft.PowerToys.Settings.UI.ViewModels
             {
                 var current = SettingsUtils.GetSettingsOrDefault<PowerDisplaySettings>(PowerDisplaySettings.ModuleName);
                 _settings.Properties.LinkedLevelsActive = current.Properties.LinkedLevelsActive;
-                _settings.Properties.ExcludedFromSyncMonitorIds = current.Properties.ExcludedFromSyncMonitorIds;
+                var exclusions = current.Properties.ExcludedFromSyncMonitorIds.ToList();
+                _settings.Properties.ExcludedFromSyncMonitorIds.Clear();
+                _settings.Properties.ExcludedFromSyncMonitorIds.AddRange(exclusions);
             }
             catch (Exception ex)
             {
